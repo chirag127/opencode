@@ -19,6 +19,90 @@ describe("ConfigMarkdown.parse", () => {
     expect(parsed.data.tools).toEqual(["read", "edit"])
   })
 
+  test.each([
+    {
+      name: "single-line",
+      fields: `model: { providerID: example, model: chat, variant: high }
+permissions: [{ action: read, resource: "*", effect: allow }]`,
+    },
+    {
+      name: "multiline",
+      fields: `model: { providerID: example,
+  model: chat, variant: high }
+permissions: [{ action: read,
+  resource: "*", effect: allow }]`,
+    },
+    {
+      name: "unindented multiline",
+      fields: `model: { providerID: example,
+model: chat, variant: high }
+permissions: [{ action: read,
+resource: "*", effect: allow }]`,
+    },
+  ])("preserves $name flow collections when repairing other frontmatter fields", (input) => {
+    const parsed = ConfigMarkdown.parse(`---
+# A leading comment
+
+description: Review changes. Keywords: review, audit
+# Keep the selected model and permissions.
+${input.fields}
+note: [Team] Review carefully
+---
+Review carefully.`)
+
+    expect(parsed.data).toEqual({
+      description: "Review changes. Keywords: review, audit",
+      model: { providerID: "example", model: "chat", variant: "high" },
+      permissions: [{ action: "read", resource: "*", effect: "allow" }],
+      note: "[Team] Review carefully",
+    })
+    expect(parsed.content).toBe("Review carefully.")
+  })
+
+  test("preserves scalar continuations while repairing descriptions", () => {
+    const parsed = ConfigMarkdown.parse(`---
+# A leading comment
+
+description: Review changes. Keywords: review, audit
+# These continuations are content, not top-level fields.
+quoted: "before
+model: text inside the quote"
+plain: https://example.com
+  with more text
+literal: |-
+  model: { untouched: text }
+  [Team] more
+folded: >-
+  first
+  second
+note: [Team] Review carefully
+---
+body`)
+
+    expect(parsed.data).toEqual({
+      description: "Review changes. Keywords: review, audit",
+      quoted: "before model: text inside the quote",
+      plain: "https://example.com with more text",
+      literal: "model: { untouched: text }\n[Team] more",
+      folded: "first second",
+      note: "[Team] Review carefully",
+    })
+    expect(parsed.content).toBe("body")
+  })
+
+  test("preserves flow aliases to earlier anchors when repairing a description", () => {
+    const parsed = ConfigMarkdown.parse(`---
+defaults: &model { providerID: example, model: chat, variant: high }
+description: Review changes. Keywords: review, audit
+model: { <<: *model }
+---
+Review carefully.`)
+
+    expect(parsed.data.model).toEqual({ providerID: "example", model: "chat", variant: "high" })
+    expect(parsed.data.description).toBe("Review changes. Keywords: review, audit")
+    expect(parsed.content).toBe("Review carefully.")
+  })
+
   test("recovers the same content again after a previous failed parse", () => {
     // gray-matter caches by content before parsing; a poisoned entry used to
     // make every later parse of the same text return silently without data.
