@@ -797,7 +797,7 @@ describe("Vcs", () => {
         // Git's diff algorithm can align the unchanged line inside conflict markers differently.
         expect(`${conflict.additions}\t${conflict.deletions}\tconflict.txt\n`).toBe(
           yield* Effect.promise(() =>
-            $`git --no-optional-locks -c core.autocrlf=false diff --no-ext-diff --no-renames --numstat HEAD -- conflict.txt`
+            $`git --no-optional-locks diff --no-ext-diff --no-renames --numstat HEAD -- conflict.txt`
               .cwd(directory)
               .text(),
           ),
