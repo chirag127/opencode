@@ -18,6 +18,7 @@ import type { VcsDefinition, VcsDiffInput } from "@opencode/plugin/effect/vcs"
 import { FileSystem } from "@opencode/schema/filesystem"
 import { VcsEvent } from "@opencode/schema/vcs-event"
 import { initGit } from "./fixture/git"
+import { withEnv } from "./fixture/env"
 import { location } from "./fixture/location"
 import { tmpdirScoped } from "./fixture/tmpdir"
 import { it, testEffect } from "./lib/effect"
@@ -650,6 +651,172 @@ describe("Vcs", () => {
         expect(status.find((row) => row.file === "evals/nested/file-7.md")).toMatchObject({ additions: 2 })
         expect(yield* Effect.promise(() => fs.readFile(path.join(directory, ".git/index")))).toEqual(index)
       }).pipe(provide(directory, { git: true, worktree: directory })),
+    ),
+  )
+
+  it.live("preserves submodule changes without repeating tracked scans for Review", () =>
+    withGit((directory) =>
+      Effect.gen(function* () {
+        const dirty = path.join(directory, "nested [dirty]")
+        const committed = path.join(directory, "nested-committed")
+        const hidden = path.join(directory, "nested-hidden")
+        yield* Effect.promise(async () => {
+          await Promise.all(
+            [dirty, committed, hidden].map(async (nested) => {
+              await initGit(nested)
+              await fs.writeFile(path.join(nested, "file.txt"), "before\n")
+              await commitAll(nested, "initial")
+            }),
+          )
+          await fs.writeFile(
+            path.join(directory, ".gitmodules"),
+            [
+              '[submodule "dirty"]\n\tpath = nested [dirty]\n\turl = ./dirty\n',
+              '[submodule "committed"]\n\tpath = nested-committed\n\turl = ./committed\n',
+              '[submodule "hidden"]\n\tpath = nested-hidden\n\turl = ./hidden\n\tignore = all\n',
+            ].join(""),
+          )
+          await fs.writeFile(path.join(directory, "plain.txt"), "before\n")
+          await fs.writeFile(path.join(directory, "gone.txt"), "gone\n")
+          await fs.writeFile(path.join(directory, "binary.bin"), new Uint8Array([0, 1]))
+          await commitAll(directory, "initial")
+          await fs.writeFile(path.join(dirty, "file.txt"), "dirty\n")
+          await fs.writeFile(path.join(committed, "file.txt"), "committed\n")
+          await commitAll(committed, "advance")
+          await fs.writeFile(path.join(hidden, "file.txt"), "hidden\n")
+          await fs.writeFile(path.join(directory, "plain.txt"), "after\n")
+          await fs.rm(path.join(directory, "gone.txt"))
+          await fs.writeFile(path.join(directory, "binary.bin"), new Uint8Array([0, 2]))
+          await fs.writeFile(path.join(directory, "staged.txt"), "staged\n")
+          await $`git add staged.txt`.cwd(directory).quiet()
+          await fs.mkdir(path.join(directory, "research"))
+          await fs.writeFile(path.join(directory, "research", "new.txt"), "untracked\n")
+        })
+        const index = yield* Effect.promise(() => fs.readFile(path.join(directory, ".git", "index")))
+        const vcs = yield* Vcs.Service
+        const trace = path.join(directory, ".git", "review.trace")
+        const diff = yield* withEnv({ GIT_TRACE: trace.replaceAll("\\", "/") }, () =>
+          vcs.diff("working", { untracked: "folders" }),
+        )
+        expect(
+          diff.map((row) => ({
+            file: row.file,
+            status: row.status,
+            additions: row.additions,
+            deletions: row.deletions,
+          })),
+        ).toEqual([
+          { file: "binary.bin", status: "modified", additions: 0, deletions: 0 },
+          { file: "gone.txt", status: "deleted", additions: 0, deletions: 1 },
+          { file: "nested [dirty]", status: "modified", additions: 0, deletions: 0 },
+          { file: "nested-committed", status: "modified", additions: 1, deletions: 1 },
+          { file: "plain.txt", status: "modified", additions: 1, deletions: 1 },
+          { file: "research/", status: "added", additions: 0, deletions: 0 },
+          { file: "staged.txt", status: "added", additions: 1, deletions: 0 },
+        ])
+        expect(diff.find((row) => row.file === "nested [dirty]")?.patch).toContain("-dirty")
+        expect(diff.find((row) => row.file === "nested-committed")?.patch).toContain("+Subproject commit ")
+        expect(diff.find((row) => row.file === "nested-committed")?.patch).not.toContain("-dirty")
+        expect(diff.find((row) => row.file === "plain.txt")?.patch).toContain("-before\n+after\n")
+
+        // A dirty-only gitlink needs one metadata scan and one patch scan, not another scan to find untracked files.
+        const commands = yield* Effect.promise(() => Bun.file(trace).text())
+        expect(
+          commands
+            .split("\n")
+            .filter(
+              (line) =>
+                line.includes("run_command:") &&
+                line.includes("nested [dirty]") &&
+                line.includes("git status --porcelain=2"),
+            ),
+        ).toHaveLength(2)
+
+        yield* Effect.promise(() => fs.writeFile(path.join(committed, "file.txt"), "committed and dirty\n"))
+        const updated = yield* vcs.diff("working")
+        expect(updated.find((row) => row.file === "nested-committed")).toMatchObject({ additions: 1, deletions: 1 })
+        expect(updated.find((row) => row.file === "nested-committed")?.patch).toContain("-dirty")
+        expect(updated.find((row) => row.file === "research/new.txt")?.patch).toContain("+untracked")
+        expect(updated.some((row) => row.file === "nested-hidden")).toBeFalse()
+        const status = yield* vcs.status()
+        expect(status.find((row) => row.file === "nested [dirty]")).toEqual({
+          file: "nested [dirty]",
+          status: "modified",
+          additions: 0,
+          deletions: 0,
+        })
+        expect(status.some((row) => row.file === "nested-hidden")).toBeFalse()
+        expect(yield* Effect.promise(() => fs.readFile(path.join(directory, ".git", "index")))).toEqual(index)
+      }),
+    ),
+  )
+
+  it.live("keeps metadata paired with paths through conflicts, intent-to-add, and type changes", () =>
+    withGit((directory) =>
+      Effect.gen(function* () {
+        const names = [
+          "-leading.txt",
+          "space [bracket].txt",
+          "caf\u00e9.txt",
+          ...(process.platform === "win32" ? [] : [":header.txt", "1\t2\tfile.txt", "line\nbreak.txt"]),
+        ]
+        yield* Effect.promise(async () => {
+          await Promise.all(names.map((file, index) => fs.writeFile(path.join(directory, file), `before-${index}\n`)))
+          await fs.writeFile(path.join(directory, "conflict.txt"), "base\n")
+          await fs.writeFile(path.join(directory, "type.txt"), "type before\n")
+          await commitAll(directory, "initial")
+          await $`git checkout -q -b side`.cwd(directory).quiet()
+          await fs.writeFile(path.join(directory, "conflict.txt"), "side\n")
+          await commitAll(directory, "side")
+          await $`git checkout -q main`.cwd(directory).quiet()
+          await fs.writeFile(path.join(directory, "conflict.txt"), "main\n")
+          await commitAll(directory, "main")
+          expect((await $`git merge --no-commit side`.cwd(directory).quiet().nothrow()).exitCode).toBe(1)
+          await Promise.all(names.map((file, index) => fs.writeFile(path.join(directory, file), `after-${index}\n`)))
+          await fs.writeFile(path.join(directory, "intent.txt"), "intent\n")
+          await $`git add --intent-to-add -- intent.txt`.cwd(directory).quiet()
+          await fs.rm(path.join(directory, "type.txt"))
+          await initGit(path.join(directory, "type.txt"))
+          await fs.writeFile(path.join(directory, "type.txt", "nested.txt"), "nested\n")
+          await commitAll(path.join(directory, "type.txt"), "nested")
+        })
+        const index = yield* Effect.promise(() => fs.readFile(path.join(directory, ".git", "index")))
+        const vcs = yield* Vcs.Service
+        const diff = yield* vcs.diff("working")
+        expect(diff.map((row) => row.file).toSorted()).toEqual(
+          [...names, "conflict.txt", "intent.txt", "type.txt"].toSorted(),
+        )
+        names.forEach((file, index) => {
+          const row = diff.find((item) => item.file === file)
+          expect(row).toMatchObject({ status: "modified", additions: 1, deletions: 1 })
+          expect(row?.patch).toContain(`-before-${index}\n+after-${index}\n`)
+        })
+        const conflict = diff.find((row) => row.file === "conflict.txt")
+        if (!conflict) throw new Error("Missing conflicted file")
+        expect(conflict.status).toBe("modified")
+        // Git's diff algorithm can align the unchanged line inside conflict markers differently.
+        expect(`${conflict.additions}\t${conflict.deletions}\tconflict.txt\n`).toBe(
+          yield* Effect.promise(() =>
+            $`git --no-optional-locks -c core.autocrlf=false diff --no-ext-diff --no-renames --numstat HEAD -- conflict.txt`
+              .cwd(directory)
+              .text(),
+          ),
+        )
+        expect(conflict.patch).toContain("+<<<<<<< HEAD")
+        expect(diff.find((row) => row.file === "intent.txt")).toMatchObject({
+          status: "added",
+          additions: 1,
+          deletions: 0,
+        })
+        expect(diff.find((row) => row.file === "intent.txt")?.patch).toContain("+intent")
+        expect(diff.find((row) => row.file === "type.txt")).toMatchObject({
+          status: "modified",
+          additions: 1,
+          deletions: 1,
+        })
+        expect(diff.find((row) => row.file === "type.txt")?.patch).toContain("+Subproject commit ")
+        expect(yield* Effect.promise(() => fs.readFile(path.join(directory, ".git", "index")))).toEqual(index)
+      }),
     ),
   )
 

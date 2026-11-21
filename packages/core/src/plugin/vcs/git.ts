@@ -367,11 +367,21 @@ function makeGit(proc: AppProcess.Interface, env?: Record<string, string>) {
     cwd: string,
     untracked: "normal" | "all" = "normal",
     names?: readonly string[],
+    ignoreSubmodules = false,
   ) {
     const pathspecs = names ? names.map((name) => `:(literal)${name}`) : ["."]
     return nuls(
       yield* text(
-        ["status", "--porcelain=v1", `--untracked-files=${untracked}`, "--no-renames", "-z", "--", ...pathspecs],
+        [
+          "status",
+          "--porcelain=v1",
+          `--untracked-files=${untracked}`,
+          "--no-renames",
+          ...(ignoreSubmodules ? ["--ignore-submodules=all"] : []),
+          "-z",
+          "--",
+          ...pathspecs,
+        ],
         { cwd },
       ),
     ).flatMap((item) => {
@@ -382,19 +392,36 @@ function makeGit(proc: AppProcess.Interface, env?: Record<string, string>) {
     })
   })
 
-  const diff = Effect.fn("VcsGit.diffNames")(function* (cwd: string, ref: string, target?: string) {
+  const diff = Effect.fn("VcsGit.diffMetadata")(function* (cwd: string, ref: string, target?: string) {
     const result = yield* run(
-      ["diff", "--no-ext-diff", "--no-renames", "--name-status", "-z", ref, ...(target ? [target] : []), "--", "."],
+      [
+        "diff",
+        "--no-ext-diff",
+        "--no-renames",
+        "--raw",
+        "--numstat",
+        "-z",
+        ref,
+        ...(target ? [target] : []),
+        "--",
+        ".",
+      ],
       { cwd },
     )
     if (result.exitCode !== 0) return yield* new DiffError({ message: "Unable to list Git changes" })
-    const list = nuls(result.text())
-    return list.flatMap((code, idx) => {
-      if (idx % 2 !== 0) return []
-      const file = list[idx + 1]
-      if (!code || !file) return []
-      return [{ file, code, status: kind(code) } satisfies Item]
-    })
+    const records = nuls(result.text())
+    const list: Item[] = []
+    let offset = 0
+    // With renames disabled, raw header/path pairs precede numstat records. Consume each path even if it starts with ':'.
+    while (true) {
+      const header = records[offset]
+      if (!header?.startsWith(":")) break
+      const code = header.slice(header.lastIndexOf(" ") + 1)
+      const file = records[offset + 1]
+      if (code && file) list.push({ file, code, status: kind(code) })
+      offset += 2
+    }
+    return { list, stats: numstat(records.slice(offset).join("\0")) }
   })
 
   const stats = Effect.fn("VcsGit.stats")(function* (cwd: string, ref: string, target?: string) {
@@ -601,10 +628,11 @@ const MAX_FOLDER_SCAN_MS = 1_000
  * `dir/` entry, as `git status` shows it, and a directory inside such a folder lists only its immediate entries, with
  * its subfolders again as one entry each.
  */
-const statusItems = Effect.fnUntraced(function* (ctx: Ctx, untracked: Untracked = "files") {
-  if (untracked === "files") return { list: yield* ctx.git.status(ctx.directory, "all"), more: undefined }
+const statusItems = Effect.fnUntraced(function* (ctx: Ctx, untracked: Untracked = "files", ignoreSubmodules = false) {
+  if (untracked === "files")
+    return { list: yield* ctx.git.status(ctx.directory, "all", undefined, ignoreSubmodules), more: undefined }
 
-  const list = yield* ctx.git.status(ctx.directory)
+  const list = yield* ctx.git.status(ctx.directory, "normal", undefined, ignoreSubmodules)
   const prefix = path.relative(ctx.worktree, ctx.directory).split(path.sep).join("/")
   if (
     !prefix ||
@@ -626,7 +654,7 @@ const statusItems = Effect.fnUntraced(function* (ctx: Ctx, untracked: Untracked 
   ) {
     const batch = names.slice(checked, checked + MAX_FOLDER_ENTRIES)
     checked += batch.length
-    entries.push(...(yield* ctx.git.status(ctx.directory, "normal", batch)))
+    entries.push(...(yield* ctx.git.status(ctx.directory, "normal", batch, ignoreSubmodules)))
   }
   return {
     list: entries.slice(0, MAX_FOLDER_ENTRIES),
@@ -763,23 +791,23 @@ const files = Effect.fnUntraced(function* (
 })
 
 const diffAgainstRef = Effect.fnUntraced(function* (ctx: Ctx, ref: string, options?: GitDiffOptions) {
-  const [list, stats, extra] = yield* Effect.all(
+  const [tracked, extra] = yield* Effect.all(
     [
       ctx.git.diff(ctx.directory, ref, options?.target),
-      ctx.git.stats(ctx.directory, ref, options?.target),
-      options?.target ? Effect.succeed({ list: [], more: undefined }) : statusItems(ctx, options?.untracked),
+      // Only untracked rows are used from status; tracked metadata and patches retain Git's submodule semantics.
+      options?.target ? Effect.succeed({ list: [], more: undefined }) : statusItems(ctx, options?.untracked, true),
     ],
-    { concurrency: 3 },
+    { concurrency: 2 },
   )
   const rows = yield* files(
     ctx,
     ref,
     merge(
-      list,
+      tracked.list,
       extra.list.filter((item) => item.code === "??"),
     ),
-    nums(stats),
-    yield* batchPatches(ctx, ref, list, options),
+    nums(tracked.stats),
+    yield* batchPatches(ctx, ref, tracked.list, options),
     options,
   )
   return withMore(rows, extra.more)
