@@ -5,6 +5,7 @@ import { TestClock } from "effect/testing"
 import { Agent } from "@opencode/core/agent"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { KVTable } from "@opencode/core/kv/sql"
 import { Model } from "@opencode/core/model"
 import { Project } from "@opencode/core/project"
 import { ProjectTable } from "@opencode/core/project/sql"
@@ -194,6 +195,62 @@ describe("SessionSearch", () => {
       expect(yield* search.search({ query: "  --  " })).toEqual({ results: [] })
     }),
   )
+
+  for (const layout of ["compact", "text"] as const)
+    it.effect(
+      `returns matching sessions when one conversation dominates the highest-ranked messages (${layout} layout)`,
+      () =>
+        Effect.gen(function* () {
+          const fixture = yield* setup
+          if (layout === "text")
+            yield* fixture.db
+              .insert(KVTable)
+              .values({
+                key: "session.search",
+                value: {
+                  version: SessionSearchIndex.Version,
+                  layout,
+                  status: "building",
+                  phase: "titles",
+                  processed: 0,
+                  total: 0,
+                  skipped: 0,
+                },
+              })
+              .run()
+              .pipe(Effect.orDie)
+          yield* fixture.addSession({ id: "long", title: "Repeated checks" })
+          yield* fixture.addSession({ id: "short", title: "Investigation notes" })
+          yield* fixture.addSession({ id: "brief", title: "Investigation notes" })
+          // Short matching messages outrank the longer notes; insert tied sources in reverse ID order.
+          yield* fixture.addMessages(
+            "long",
+            Array.from({ length: 125 }, (_, index) =>
+              user(`long_${String(124 - index).padStart(3, "0")}`, "zephyrmarker"),
+            ),
+          )
+          const note = `Notes about zephyrmarker. ${"Background context. ".repeat(100)}`
+          yield* fixture.addMessages("short", [user("short_1", note)])
+          yield* fixture.addMessages("brief", [user("brief_1", note)])
+          yield* fixture.buildIndex
+          expect(yield* SessionSearchIndex.state(fixture.db)).toMatchObject({ layout })
+
+          const found = yield* fixture.search.search({ query: "zephyrmarker" })
+          expect(found.results?.map((item) => item.sessionID)).toEqual([ses("long"), ses("brief"), ses("short")])
+          expect(found.results?.map((item) => item.matches.map((match) => match.messageID))).toEqual([
+            [msg("long_000"), msg("long_001"), msg("long_002")],
+            [msg("brief_1")],
+            [msg("short_1")],
+          ])
+          expect(
+            (yield* fixture.search.search({ query: "zephyrmarker", limit: 1 })).results?.map((item) => item.sessionID),
+          ).toEqual([ses("long")])
+          // The last slot goes to the lower ID among equal-score sessions, not the first inserted one.
+          expect(
+            (yield* fixture.search.search({ query: "zephyrmarker", limit: 2 })).results?.map((item) => item.sessionID),
+          ).toEqual([ses("long"), ses("brief")])
+        }),
+    )
 
   it.effect("folds accents on query and centers snippets on accented and stemmed matches while preserving original text", () =>
     Effect.gen(function* () {

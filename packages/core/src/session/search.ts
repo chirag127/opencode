@@ -210,7 +210,6 @@ const searchSessions = Effect.fnUntraced(function* (
   if (!fallback) return { results: [] }
 
   const limit = clamp(input.limit ?? 5, 1, 20)
-  const hitLimit = Math.min(400, Math.max(100, limit * 20))
   const filters = sessionConditions({
     sessionID: input.sessionID,
     projectID: input.sessionID ? undefined : input.projectID,
@@ -219,14 +218,31 @@ const searchSessions = Effect.fnUntraced(function* (
   })
   const runMatch = (expression: string) =>
     db.all<{ source_id: string; session_id: string; score: number }>(sql`
-      SELECT d.source_id AS source_id, d.session_id AS session_id,
-        bm25(session_search, 3.0, 2.0, 1.5, 1.0) AS score
-      FROM session_search
-      JOIN session_search_document AS d ON d.id = session_search.rowid
-      JOIN session_v2 ON session_v2.id = d.session_id
-      WHERE session_search MATCH ${expression}${filters.length > 0 ? sql` AND ${and(...filters)}` : sql``}
-      ORDER BY score
-      LIMIT ${hitLimit}
+      WITH matches AS MATERIALIZED (
+        SELECT d.source_id, d.session_id,
+          bm25(session_search, 3.0, 2.0, 1.5, 1.0) AS score
+        FROM session_search
+        JOIN session_search_document AS d ON d.id = session_search.rowid
+        JOIN session_v2 ON session_v2.id = d.session_id
+        WHERE session_search MATCH ${expression}${filters.length > 0 ? sql` AND ${and(...filters)}` : sql``}
+      ), selected AS (
+        SELECT session_id
+        FROM matches
+        GROUP BY session_id
+        ORDER BY min(score), session_id
+        LIMIT ${limit}
+      ), ranked AS (
+        SELECT matches.source_id, matches.session_id, matches.score,
+          row_number() OVER (
+            PARTITION BY matches.session_id ORDER BY matches.score, matches.source_id
+          ) AS ordinal
+        FROM matches
+        JOIN selected ON selected.session_id = matches.session_id
+      )
+      SELECT source_id, session_id, score
+      FROM ranked
+      WHERE ordinal <= ${MAX_MATCHES_PER_SESSION}
+      ORDER BY score, session_id, source_id
     `)
 
   const raw = hasFtsSyntax(folded) ? folded : fallback
