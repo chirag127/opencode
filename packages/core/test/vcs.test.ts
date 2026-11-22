@@ -549,7 +549,7 @@ describe("Vcs", () => {
     ),
   )
 
-  it.live("lists remote branches without remote HEAD symrefs", () =>
+  it.live("lists direct /HEAD branches without remote HEAD symrefs", () =>
     withGit((directory) =>
       Effect.gen(function* () {
         yield* Effect.promise(async () => {
@@ -562,12 +562,16 @@ describe("Vcs", () => {
           await $`git fetch --quiet fork`.cwd(directory).quiet()
           await $`git remote set-head origin main`.cwd(directory).quiet()
           await $`git remote set-head fork main`.cwd(directory).quiet()
+          await $`git branch topic/HEAD refs/heads/main`.cwd(directory).quiet()
+          await $`git update-ref refs/remotes/origin/topic/HEAD HEAD`.cwd(directory).quiet()
         })
         const vcs = yield* Vcs.Service
-        expect(yield* vcs.branches()).toEqual(["main", "fork/main", "origin/main"])
-        expect(yield* vcs.branches({ limit: 2 })).toEqual(["main", "fork/main"])
-        expect(yield* vcs.branches({ search: "origin" })).toEqual(["origin/main"])
+        expect(yield* vcs.branches()).toEqual(["main", "topic/HEAD", "fork/main", "origin/main", "origin/topic/HEAD"])
+        expect(yield* vcs.branches({ limit: 3 })).toEqual(["main", "topic/HEAD", "fork/main"])
+        expect(yield* vcs.branches({ search: "origin" })).toEqual(["origin/main", "origin/topic/HEAD"])
         expect(yield* vcs.branches({ search: "MAIN", limit: 2 })).toEqual(["main", "fork/main"])
+        expect(yield* vcs.branches({ search: " TOPIC/head " })).toEqual(["topic/HEAD", "origin/topic/HEAD"])
+        expect(yield* vcs.branches({ search: "HEAD", limit: 2 })).toEqual(["topic/HEAD", "origin/topic/HEAD"])
       }),
     ),
   )
