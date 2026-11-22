@@ -151,12 +151,12 @@ test("a language whose chunk fails to load keeps English and says so", async ({ 
   await expect(settings.locator('[data-action="settings-language"]')).toContainText("English")
 })
 
-test("Questions settings default independently of old Permissions settings and survive reload", async ({ page }) => {
+test("notification switches have accessible names and preserve independent settings on reload", async ({ page }) => {
   const { settings } = await open(page, {
     seed: {
       settings: {
         notifications: { agent: false, permissions: false, errors: true },
-        sounds: { permissionsEnabled: false, permissions: "alert-05" },
+        sounds: { permissionsEnabled: false, permissions: "alert-05", interfaceEnabled: false },
       },
     },
   })
@@ -175,7 +175,21 @@ test("Questions settings default independently of old Permissions settings and s
   ])
   const questions = settings.getByRole("switch", { name: "Questions", exact: true })
 
-  const permissions = settings.locator('[data-action="settings-notifications-permissions"]').getByRole("switch")
+  await test.step("notification switch names", async () => {
+    await expect(settings.getByRole("switch")).toHaveCount(5)
+
+    for (const [action, name] of [
+      ["settings-notifications-agent", "Agent"],
+      ["settings-notifications-permissions", "Permissions"],
+      ["settings-notifications-questions", "Questions"],
+      ["settings-notifications-errors", "Errors"],
+      ["settings-sounds-interface", "Interface"],
+    ]) {
+      await expect(settings.locator(`[data-action="${action}"]`).getByRole("switch")).toHaveAccessibleName(name)
+    }
+  })
+
+  const permissions = settings.getByRole("switch", { name: "Permissions", exact: true })
 
   const questionSound = settings.locator('[data-action="settings-sounds-questions"]')
 
@@ -191,16 +205,37 @@ test("Questions settings default independently of old Permissions settings and s
   await page.getByRole("option", { name: "Alert 02", exact: true }).click()
   await expect(questionSound).toHaveText("Alert 02")
 
+  const changes = [
+    ["Agent", false],
+    ["Permissions", false],
+    ["Errors", true],
+    ["Interface", false],
+  ] as const
+
+  for (const [name, checked] of changes) {
+    const toggle = settings.getByRole("switch", { name, exact: true })
+    await expect(toggle).toBeChecked({ checked })
+    await toggle.press("Space")
+    await expect(toggle).toBeChecked({ checked: !checked })
+  }
+
+  await expect(questions).not.toBeChecked()
+
   await page.reload()
   await expect(questions).not.toBeChecked()
   await expect(questionSound).toHaveText("Alert 02")
-  await expect(permissions).not.toBeChecked()
+
+  for (const [name, checked] of changes) {
+    await expect(settings.getByRole("switch", { name, exact: true })).toBeChecked({ checked: !checked })
+  }
+
   await expect(permissionSound).toHaveText("None")
   await questions.locator("..").locator('[data-slot="switch-control"]').click()
   await questionSound.click()
   await page.getByRole("option", { name: "None", exact: true }).click()
   await expect(questions).toBeChecked()
   await expect(questionSound).toHaveText("None")
+  await expect(permissions).toBeChecked()
   await settings.getByRole("combobox", { name: "Search", exact: true }).fill("Questions")
   await expect(settings.locator('[data-setting-target="settings-notifications-questions"]')).toBeVisible()
   await expect(settings.locator('[data-setting-target="settings-sounds-questions"]')).toBeVisible()
