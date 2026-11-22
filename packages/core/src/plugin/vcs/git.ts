@@ -264,13 +264,17 @@ function makeGit(proc: AppProcess.Interface, env?: Record<string, string>) {
         "for-each-ref",
         "--sort=refname",
         "--sort=-committerdate",
-        "--format=%(refname:lstrip=2)",
+        "--format=%(refname:lstrip=2)%00%(symref)",
         "refs/heads",
         "refs/remotes",
       ],
       { cwd },
     ))
-      .filter((item) => !item.endsWith("/HEAD") && (!search || item.toLowerCase().includes(search)))
+      .flatMap((item) => {
+        const [name, symref] = item.split("\0")
+        return symref && name.endsWith("/HEAD") ? [] : [name]
+      })
+      .filter((item) => !search || item.toLowerCase().includes(search))
       .slice(0, options?.limit) satisfies BranchList
   })
 
