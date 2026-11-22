@@ -44,14 +44,24 @@ export function updates(message: SessionMessage.Info, cwd: string, capabilities:
   if (message.type === "user")
     return [
       { sessionUpdate: "user_message_chunk", messageId: message.id, content: { type: "text", text: message.text } },
-      ...partsToContentChunks(
-        (message.files ?? []).map((file) => ({
-          type: "file",
-          url: file.source.type === "uri" ? file.source.uri : `data:${file.mime};base64,${file.data}`,
-          filename: file.name,
-          mime: file.mime,
-        })),
-      ).map((chunk) => ({ sessionUpdate: "user_message_chunk" as const, messageId: message.id, ...chunk })),
+      ...(message.files ?? []).flatMap((file): SessionUpdate[] => {
+        if (file.source.type === "uri" && file.mime.startsWith("image/") && file.data)
+          return [
+            {
+              sessionUpdate: "user_message_chunk",
+              messageId: message.id,
+              content: { type: "image", mimeType: file.mime, data: file.data, uri: file.source.uri },
+            },
+          ]
+        return partsToContentChunks([
+          {
+            type: "file",
+            url: file.source.type === "uri" ? file.source.uri : `data:${file.mime};base64,${file.data}`,
+            filename: file.name,
+            mime: file.mime,
+          },
+        ]).map((chunk) => ({ sessionUpdate: "user_message_chunk" as const, messageId: message.id, ...chunk }))
+      }),
     ]
   if (message.type === "compaction") {
     const update = ACPCompaction.replay(message, capabilities.compaction)

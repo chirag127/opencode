@@ -1,10 +1,36 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionMessage } from "@opencode/schema/session-message"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 import { tmpdir } from "../fixture/tmpdir"
 import { assistantMessage, fileDiff, makeSession, startWire } from "./wire-fixture"
 
 describe("acp session replay over the wire", () => {
+  test("replays captured pixels for an image whose original file is missing", async () => {
+    await using dir = await tmpdir()
+    const uri = pathToFileURL(path.join(dir.path, "missing-image.png")).href
+    const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="
+    await using acp = await startWire()
+    acp.server.sessions.set("ses_image_replay", makeSession("ses_image_replay", { cwd: dir.path }))
+    acp.server.messages.set("ses_image_replay", [
+      {
+        id: "msg_image",
+        type: "user",
+        text: "Describe the saved image",
+        time: { created: 1 },
+        files: [{ data, mime: "image/png", name: "missing-image.png", source: { type: "uri", uri } }],
+      },
+    ])
+    await acp.initialize()
+
+    await acp.request("session/load", { cwd: dir.path, sessionId: "ses_image_replay", mcpServers: [] })
+
+    expect(acp.updates.filter((item) => item.update.sessionUpdate === "user_message_chunk")).toMatchObject([
+      { update: { messageId: "msg_image", content: { type: "text", text: "Describe the saved image" } } },
+      { update: { messageId: "msg_image", content: { type: "image", mimeType: "image/png", data, uri } } },
+    ])
+  })
+
   test("replays user, text, reasoning, and tool messages in order on session/load", async () => {
     await using dir = await tmpdir()
     const edited = path.resolve(dir.path, "edited.ts")
